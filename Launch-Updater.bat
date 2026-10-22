@@ -20,6 +20,7 @@ set "DRIVE=%~d0"
 set "SCRIPT_DIR=%~dp0"
 set "GUI_SCRIPT=%SCRIPT_DIR%DFIR-Updater-GUI.ps1"
 set "SETUP_SCRIPT=%SCRIPT_DIR%Setup-AutoLaunch.ps1"
+set "DIR_SETUP_SCRIPT=%SCRIPT_DIR%Setup-Directories.ps1"
 
 :: ---- Header ----
 echo.
@@ -48,6 +49,17 @@ if not exist "%GUI_SCRIPT%" (
     echo.
     pause
     exit /b 1
+)
+
+:: ---- Verify and Create Folder Structure ----
+if exist "%DIR_SETUP_SCRIPT%" (
+    echo  [INFO] Verifying required folder structure...
+    powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%DIR_SETUP_SCRIPT%"
+    echo.
+) else (
+    echo  [WARN] Directory setup script not found: %DIR_SETUP_SCRIPT%
+    echo         Skipping folder verification.
+    echo.
 )
 
 :: ---- Check if auto-launch task is registered ----

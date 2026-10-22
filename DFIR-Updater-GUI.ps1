@@ -510,6 +510,7 @@ public class ToolItem : INotifyPropertyChanged
                             <StackPanel Orientation="Horizontal">
                                 <Button x:Name="btnUpdateAll" Content="&#x26A1; Update All" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0"/>
                                 <Button x:Name="btnSelectUpdates" Content="Select All Updates" Style="{StaticResource ActionButton}"/>
+                                <Button x:Name="btnSelectMissing" Content="Select Missing Tools" Style="{StaticResource ActionButton}"/>
                                 <Button x:Name="btnDeselectAll"    Content="Deselect All"       Style="{StaticResource ActionButton}"/>
                                 <Button x:Name="btnUpdateSelected" Content="Update Selected"    Style="{StaticResource ActionButton}"/>
                             </StackPanel>
@@ -930,6 +931,7 @@ $txtSummary        = $window.FindName("txtSummary")
 $progressBar       = $window.FindName("progressBar")
 $dgTools           = $window.FindName("dgTools")
 $btnSelectUpdates  = $window.FindName("btnSelectUpdates")
+$btnSelectMissing  = $window.FindName("btnSelectMissing")
 $btnDeselectAll    = $window.FindName("btnDeselectAll")
 $btnUpdateSelected = $window.FindName("btnUpdateSelected")
 $btnUpdateAll      = $window.FindName("btnUpdateAll")
@@ -980,6 +982,7 @@ $txtUnblockResult           = $window.FindName("txtUnblockResult")
 # ─── State ───────────────────────────────────────────────────────────────────
 $script:ToolItems = [System.Collections.ObjectModel.ObservableCollection[ToolItem]]::new()
 $dgTools.ItemsSource = $script:ToolItems
+$script:InitialStartupComplete = $false
 
 # ─── Category Map: derive display category from path prefix ─────────────────
 $script:CategoryMap = @{
@@ -1225,6 +1228,7 @@ function Update-ForensicModeUI {
 
         # Disable all modification buttons
         $btnSelectUpdates.IsEnabled  = $false
+        $btnSelectMissing.IsEnabled  = $false
         $btnDeselectAll.IsEnabled    = $false
         $btnUpdateSelected.IsEnabled = $false
         $btnUpdateAll.IsEnabled      = $false
@@ -1246,6 +1250,7 @@ function Update-ForensicModeUI {
 
         # Enable buttons
         $btnSelectUpdates.IsEnabled  = $true
+        $btnSelectMissing.IsEnabled  = $true
         $btnDeselectAll.IsEnabled    = $true
         $btnUpdateSelected.IsEnabled = $true
         $btnUpdateAll.IsEnabled      = $true
@@ -1772,12 +1777,10 @@ $separator
 # ─── Helper: Test internet connectivity ──────────────────────────────────────
 function Test-InternetConnection {
     try {
-        $request = [System.Net.WebRequest]::Create("https://api.github.com")
+        # Use Microsoft NCSI endpoint to avoid API rate limits
+        $request = [System.Net.WebRequest]::Create("http://www.msftconnecttest.com/connecttest.txt")
         $request.Timeout = 5000
         $request.Method  = "HEAD"
-        if ($request -is [System.Net.HttpWebRequest]) {
-            $request.UserAgent = "DFIR-Updater/1.0"
-        }
         $response = $request.GetResponse()
         $response.Close()
         return $true
@@ -1795,24 +1798,25 @@ function Start-UpdateCheck {
         return
     }
 
-    # Network pre-flight check
-    if ($script:HasIntegrityCheck) {
-        $connectivity = Test-NetworkConnectivity
-        if (-not $connectivity.IsConnected) {
-            Write-Log "WARNING: No internet connectivity detected. Update check may fail."
-            Set-StatusText "No internet connection detected. Updates may not be available."
-        } elseif (-not $connectivity.GitHubReachable) {
-            Write-Log "WARNING: GitHub is not reachable. GitHub-sourced tools may fail to check."
-        } else {
-            Write-Log "Network pre-flight: OK ($($connectivity.Details))"
+    # Check internet first
+        $hasInternet = $true
+        try {
+            # Use Microsoft NCSI endpoint to avoid GitHub API rate limits masking as offline status
+            $req = [System.Net.WebRequest]::Create("http://www.msftconnecttest.com/connecttest.txt")
+            $req.Timeout = 5000
+            $req.Method  = "HEAD"
+            $resp = $req.GetResponse()
+            $resp.Close()
+        } catch {
+            $hasInternet = $false
         }
-    }
 
     # Disable buttons during check
     $btnRefresh.IsEnabled        = $false
     $btnUpdateSelected.IsEnabled = $false
     $btnUpdateAll.IsEnabled      = $false
     $btnSelectUpdates.IsEnabled  = $false
+    $btnSelectMissing.IsEnabled  = $false
 
     Set-StatusText "Checking for updates..."
     Set-Progress -Value 0 -Indeterminate $true
@@ -1964,23 +1968,27 @@ function Start-UpdateCheck {
                         $matchItem = $ToolItems | Where-Object { $_.Name -eq $r.ToolName } | Select-Object -First 1
                         if (-not $matchItem) { continue }
 
-                        if ($r.LatestVersion) {
-                            $matchItem.LatestVersion = $r.LatestVersion
-                        }
-
-                        if ($r.DownloadUrl) {
-                            $matchItem.DownloadUrl = $r.DownloadUrl
-                        }
-
-                        if ($r.Notes) {
-                            $matchItem.Notes = $r.Notes
-                        }
+                        if ($r.LatestVersion) { $matchItem.LatestVersion = $r.LatestVersion }
+                        if ($r.DownloadUrl) { $matchItem.DownloadUrl = $r.DownloadUrl }
+                        if ($r.Notes) { $matchItem.Notes = $r.Notes }
 
                         # Check if PM provided a version where normal check couldn't
                         $pmVer = $pmSupplemented[$r.ToolName]
 
-                        # Determine status
-                        if ($r.UpdateAvailable -eq $true) {
+                        # ── Strict State Resolution ──
+                        $expectedPath = Join-Path -Path $DriveRoot -ChildPath $matchItem.ToolPath
+                        $isMissing = (-not (Test-Path -LiteralPath $expectedPath))
+                        $hasLatest = ($matchItem.LatestVersion -and $matchItem.LatestVersion -notin @('N/A', 'Checking...', 'Error', 'No Internet', 'Unknown'))
+                        $isUnknown = ($matchItem.CurrentVersion -eq 'Unknown' -or [string]::IsNullOrWhiteSpace($matchItem.CurrentVersion))
+
+                        if ($isMissing -and $hasLatest) {
+                            $matchItem.Status    = "Missing (Ready to install)"
+                            $matchItem.StatusKey = "UpdateAvailable"
+                            if (-not $isUnknown) { $matchItem.CurrentVersion = "Unknown" }
+                        } elseif ($isUnknown -and $hasLatest) {
+                            $matchItem.Status    = "Ready to install"
+                            $matchItem.StatusKey = "UpdateAvailable"
+                        } elseif ($r.UpdateAvailable -eq $true) {
                             $matchItem.Status    = "Update available"
                             $matchItem.StatusKey = "UpdateAvailable"
                         } elseif ($r.UpdateAvailable -eq $false) {
@@ -1995,7 +2003,6 @@ function Start-UpdateCheck {
                                     $matchItem.Status    = "Up to date"
                                     $matchItem.StatusKey = "UpToDate"
                                 } else {
-                                    # Normalize: strip leading 'v' for comparison
                                     $normCur = ($curVer -replace '^v','').Trim()
                                     $normPm  = ($pmVer  -replace '^v','').Trim()
                                     if ($normCur -eq $normPm) {
@@ -2007,7 +2014,6 @@ function Start-UpdateCheck {
                                     }
                                 }
                             } else {
-                                # No current version known — show PM version as latest, suggest verify
                                 $matchItem.Status    = "Latest: $pmVer"
                                 $matchItem.StatusKey = "ManualCheck"
                             }
@@ -2100,6 +2106,7 @@ function Start-UpdateCheck {
             $btnUpdateSelected.IsEnabled = $true
             $btnUpdateAll.IsEnabled      = $true
             $btnSelectUpdates.IsEnabled  = $true
+            $btnSelectMissing.IsEnabled  = $true
             Set-Progress -Value 100 -Indeterminate $false
             Update-Summary
             $script:LastCheckTime = Get-Date
@@ -2109,6 +2116,7 @@ function Start-UpdateCheck {
             try { $btnRefresh.IsEnabled = $true } catch {}
             try { $btnUpdateSelected.IsEnabled = $true } catch {}
             try { $btnSelectUpdates.IsEnabled = $true } catch {}
+            try { $btnSelectMissing.IsEnabled = $true } catch {}
         }
     }
 
@@ -2170,6 +2178,29 @@ function Start-UpdateCheck {
                 # Runspace is managed by the pool — no manual close needed
 
                 Complete-UpdateCheck
+
+                # --- Auto-Select Missing Tools on Startup ---
+                if (-not $script:InitialStartupComplete -and -not $script:ForensicModeActive) {
+                    $script:InitialStartupComplete = $true
+                    $missingCount = 0
+                    foreach ($item in $script:ToolItems) {
+                        if ($item.ToolPath) {
+                            $expectedPath = Join-Path -Path $script:DriveRoot -ChildPath $item.ToolPath
+                            if (-not (Test-Path -LiteralPath $expectedPath)) {
+                                $item.IsSelected = $true
+                                $item.StatusKey = "UpdateAvailable"
+                                $item.Status = "Tool missing (Ready to download)"
+                                $missingCount++
+                            }
+                        }
+                    }
+                    if ($missingCount -gt 0) {
+                        $dgTools.Items.Refresh()
+                        Update-Summary 
+                        Write-Log "Startup scan: Auto-selected $missingCount missing tool(s) for download."
+                    }
+                }
+                # --------------------------------------------
 
                 # Check results
                 $noInternet = @($script:ToolItems | Where-Object { $_.StatusKey -eq "Error" -and $_.LatestVersion -eq "No Internet" }).Count
@@ -2270,6 +2301,7 @@ function Start-SelectedUpdates {
     $btnUpdateSelected.IsEnabled = $false
     $btnUpdateAll.IsEnabled      = $false
     $btnSelectUpdates.IsEnabled  = $false
+    $btnSelectMissing.IsEnabled  = $false
     $btnDeselectAll.IsEnabled    = $false
     $btnCancelUpdate.Visibility  = [System.Windows.Visibility]::Visible
     $btnRetryFailed.Visibility   = [System.Windows.Visibility]::Collapsed
@@ -2357,9 +2389,9 @@ function Start-SelectedUpdates {
         foreach ($job in $UpdateJobs) {
             $idx++
             $name = $job.Name
-            Write-RsDebugLog "[$idx/$($UpdateJobs.Count)] Processing '$name' | URL=$($job.DownloadUrl) | Type=$($job.InstallType) | Scoop=$($job.ScoopId) | Winget=$($job.WingetId)" 'DEBUG'
+            Write-RsDebugLog "[$idx/$($UpdateJobs.Count)] Processing '$name' | URL=$($job.DownloadUrl) | Type=$($job.InstallType)" 'DEBUG'
 
-            # ── Check cancellation ──
+            # ── 1. Pre-Download Cancel Check ──
             if ($CancelFlag.Cancelled) {
                 Write-RsDebugLog "[$idx] '$name' cancelled by user" 'INFO'
                 $cancelCount++
@@ -2369,12 +2401,10 @@ function Start-SelectedUpdates {
                     if ($item) { $item.StatusKey = "ManualCheck" }
                 }.GetNewClosure())
                 $resultDetails += @{ Name = $name; Result = 'Cancelled'; Message = 'Cancelled by user' }
-                continue
+                continue # Immediately skips to next tool, bypassing JSON save entirely
             }
 
-            # Mark as "Downloading..." on UI
             Set-ToolStatus $name "Downloading..."
-
             $success = $false
             $message = ""
 
@@ -2383,36 +2413,30 @@ function Start-SelectedUpdates {
             if ($HasPkgManager) {
                 if ($job.ScoopId -and (Test-PackageManager 'scoop')) {
                     $pmTried = $true
-                    Write-RsDebugLog "[$idx] '$name' -> trying scoop ($($job.ScoopId))" 'DEBUG'
                     Set-ToolStatus $name "Installing via scoop..."
                     try {
                         $pmResult = Install-ScoopPackage -PackageId $job.ScoopId
                         $success = $pmResult.Success
                         $message = $pmResult.Message
-                        Write-RsDebugLog "[$idx] '$name' scoop result: Success=$success Msg=$message" 'DEBUG'
                     } catch {
                         $message = "scoop update failed for '$name': $_"
-                        Write-RsDebugLog "[$idx] '$name' scoop exception: $_" 'ERROR'
                     }
                 }
                 elseif ($job.WingetId -and (Test-PackageManager 'winget')) {
                     $pmTried = $true
-                    Write-RsDebugLog "[$idx] '$name' -> trying winget ($($job.WingetId))" 'DEBUG'
                     Set-ToolStatus $name "Installing via winget..."
                     $installPath = Join-Path $DriveRoot $job.ToolPath
                     try {
                         $pmResult = Install-WingetPackage -PackageId $job.WingetId -TargetDir $installPath
                         $success = $pmResult.Success
                         $message = $pmResult.Message
-                        Write-RsDebugLog "[$idx] '$name' winget result: Success=$success Msg=$message" 'DEBUG'
                     } catch {
                         $message = "winget update failed for '$name': $_"
-                        Write-RsDebugLog "[$idx] '$name' winget exception: $_" 'ERROR'
                     }
                 }
             }
 
-            # Check cancellation between strategies
+            # ── 2. Mid-Download Cancel Check ──
             if ($CancelFlag.Cancelled -and -not $success) {
                 $cancelCount++
                 Set-ToolStatus $name "Cancelled"
@@ -2421,7 +2445,7 @@ function Start-SelectedUpdates {
                     if ($item) { $item.StatusKey = "ManualCheck" }
                 }.GetNewClosure())
                 $resultDetails += @{ Name = $name; Result = 'Cancelled'; Message = 'Cancelled by user' }
-                continue
+                continue # Bypasses JSON save
             }
 
             # ── Strategy 2: Fall back to direct download ──
@@ -2437,7 +2461,6 @@ function Start-SelectedUpdates {
                         $message = "Failed to open URL for '$name': $_"
                     }
                 } elseif (-not [string]::IsNullOrWhiteSpace($job.DownloadUrl)) {
-                    # Map unsupported install types to closest supported type
                     $effectiveType = $job.InstallType
                     if ($effectiveType -notin @('extract_zip', 'extract_7z', 'copy_exe', 'manual')) {
                         $effectiveType = 'extract_zip'
@@ -2449,40 +2472,37 @@ function Start-SelectedUpdates {
                     } else {
                         Set-ToolStatus $name "Downloading..."
                     }
-                    Write-RsDebugLog "[$idx] '$name' -> direct download: $($job.DownloadUrl) (type=$effectiveType)" 'DEBUG'
                     try {
-                        $result = Install-ToolUpdate -ToolName $name `
-                                                     -DownloadUrl $job.DownloadUrl `
-                                                     -InstallPath $installPath `
-                                                     -InstallType $effectiveType `
-                                                     -Confirm:$false
+                        $result = Install-ToolUpdate -ToolName $name -DownloadUrl $job.DownloadUrl -InstallPath $installPath -InstallType $effectiveType -Confirm:$false
                         $success = $result.Success
                         $message += $result.Message
-                        Write-RsDebugLog "[$idx] '$name' download result: Success=$success Msg=$($result.Message)" 'DEBUG'
                     } catch {
                         $message += "Update failed for '$name': $_"
-                        Write-RsDebugLog "[$idx] '$name' download exception: $_" 'ERROR'
                     }
                 } elseif (-not $pmTried) {
                     $message = "No download URL or package manager available for '$name'."
-                    Write-RsDebugLog "[$idx] '$name' -> no download URL or PM available" 'WARN'
                 }
-            } elseif (-not $success -and -not $HasModule) {
-                # Preview mode: simulate
-                Set-ToolStatus $name "Installing..."
-                Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 1500)
-                $success = ((Get-Random -Minimum 0 -Maximum 10) -lt 8)
-                $message = if ($success) { "Simulated success." } else { "Simulated failure." }
             }
 
+            # ── 3. Strict Physical Validation (Prevents False Positives) ──
+            if ($success -and $job.InstallType -ne 'manual') {
+                $verifyPath = Join-Path $DriveRoot $job.ToolPath
+                if (-not (Test-Path -LiteralPath $verifyPath) -or @(Get-ChildItem -LiteralPath $verifyPath -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                    $success = $false
+                    $message = "Validation failed: Backend reported success, but target folder is empty or missing."
+                    Write-RsDebugLog "[$idx] '$name' validation failed post-install." 'ERROR'
+                }
+            }
+
+            # ── 4. JSON Update (ONLY triggers if strictly successful) ──
             if ($success) {
                 $successCount++
                 Set-ToolStatus $name "Extracting..."
-                Start-Sleep -Milliseconds 200   # brief visual pause so user sees the stage
-                # Persist updated version to config file (file I/O from runspace thread)
+                Start-Sleep -Milliseconds 200   
+
                 $savedVersion = $null
                 $toolItem = $ToolItems | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-                if ($toolItem -and $toolItem.LatestVersion -and $toolItem.LatestVersion -notin @("N/A","Error","No Internet","Checking...")) {
+                if ($toolItem -and $toolItem.LatestVersion -and $toolItem.LatestVersion -notin @("N/A","Error","No Internet","Checking...","Unknown")) {
                     $savedVersion = $toolItem.LatestVersion
                     try {
                         $raw = [System.IO.File]::ReadAllText($ConfigPath)
@@ -2501,12 +2521,11 @@ function Start-SelectedUpdates {
                         Write-RsDebugLog "[$idx] '$name' failed to save version to config: $_" 'ERROR'
                     }
                 }
+                
                 [void]$Dispatcher.BeginInvoke([Action]{
                     $item = $ToolItems | Where-Object { $_.Name -eq $name } | Select-Object -First 1
                     if ($item) {
-                        if ($savedVersion) {
-                            $item.CurrentVersion = $savedVersion
-                        }
+                        if ($savedVersion) { $item.CurrentVersion = $savedVersion }
                         $item.Status    = "Updated"
                         $item.StatusKey = "UpToDate"
                         $item.IsSelected = $false
@@ -2514,6 +2533,7 @@ function Start-SelectedUpdates {
                 }.GetNewClosure())
                 $resultDetails += @{ Name = $name; Result = 'Success'; Message = $message }
             } else {
+                # ── FAILURE BRANCH - JSON IS NEVER TOUCHED ──
                 $failCount++
                 [void]$Dispatcher.BeginInvoke([Action]{
                     $item = $ToolItems | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -2589,6 +2609,7 @@ function Start-SelectedUpdates {
                 $btnUpdateSelected.IsEnabled = $true
                 $btnUpdateAll.IsEnabled      = $true
                 $btnSelectUpdates.IsEnabled  = $true
+                $btnSelectMissing.IsEnabled  = $true
                 $btnDeselectAll.IsEnabled    = $true
                 $btnCancelUpdate.Visibility  = [System.Windows.Visibility]::Collapsed
                 $btnCancelUpdate.IsEnabled   = $true
@@ -2616,9 +2637,9 @@ function Start-SelectedUpdates {
                 Update-Summary
 
                 # ── Inline results in the log panel (no MessageBox) ──
-                Write-Log "────────────────────────────────────────"
+                Write-Log "========================================"
                 Write-Log "UPDATE COMPLETE: $s succeeded, $f failed, $c cancelled"
-                Write-Log "────────────────────────────────────────"
+                Write-Log "========================================"
 
                 if ($details -and $details.Count -gt 0) {
                     foreach ($d in $details) {
@@ -2634,7 +2655,7 @@ function Start-SelectedUpdates {
                         Write-Log "  $icon  $($d.Name)$msg"
                     }
                 }
-                Write-Log "────────────────────────────────────────"
+                Write-Log "========================================"
 
                 # Build status text summary
                 $statusParts = @()
@@ -2692,6 +2713,7 @@ function Start-SelectedUpdates {
             $btnUpdateSelected.IsEnabled = $true
             $btnUpdateAll.IsEnabled      = $true
             $btnSelectUpdates.IsEnabled  = $true
+            $btnSelectMissing.IsEnabled  = $true
             $btnDeselectAll.IsEnabled    = $true
             $btnCancelUpdate.Visibility  = [System.Windows.Visibility]::Collapsed
             $btnCancelUpdate.IsEnabled   = $true
@@ -3387,6 +3409,43 @@ $btnSelectUpdates.Add_Click({
     $dgTools.Items.Refresh()
 })
 
+# Select Missing Tools (First-Run Downloads)
+$btnSelectMissing.Add_Click({
+    if ($script:ForensicModeActive) {
+        [System.Windows.MessageBox]::Show(
+            "Forensic Mode is active.`nDisable Forensic Mode before updating tools.",
+            "Forensic Mode",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        return
+    }
+
+    $missingCount = 0
+    foreach ($item in $script:ToolItems) {
+        if ($item.ToolPath) {
+            $expectedPath = Join-Path -Path $script:DriveRoot -ChildPath $item.ToolPath
+            if (-not (Test-Path -LiteralPath $expectedPath)) {
+                $item.IsSelected = $true
+                $item.StatusKey = "UpdateAvailable"
+                $item.Status = "Tool missing"
+                $missingCount++
+            }
+        }
+    }
+    $dgTools.Items.Refresh()
+    Write-Log "Selected $missingCount missing tool(s) for initial download."
+    
+    if ($missingCount -eq 0) {
+        [System.Windows.MessageBox]::Show(
+            "All tools currently tracked in the configuration exist on the drive.",
+            "No Missing Tools",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Information
+        )
+    }
+})
+
 # Deselect All
 $btnDeselectAll.Add_Click({
     foreach ($item in $script:ToolItems) {
@@ -3942,6 +4001,7 @@ $window.Add_Loaded({
             $btnRefresh.IsEnabled        = $true
             $btnUpdateSelected.IsEnabled = $true
             $btnSelectUpdates.IsEnabled  = $true
+            $btnSelectMissing.IsEnabled  = $true
             $btnDeselectAll.IsEnabled    = $true
         } catch {}
     }
