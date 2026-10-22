@@ -96,10 +96,6 @@ function Get-KnownDFIRRepos {
 
     .OUTPUTS
         System.Collections.Hashtable
-
-    .EXAMPLE
-        $repos = Get-KnownDFIRRepos
-        $repos['autopsy']  # Returns 'sleuthkit/autopsy'
     #>
     [CmdletBinding()]
     param()
@@ -301,9 +297,6 @@ function _Extract-VersionFromName {
     <#
     .SYNOPSIS
         Attempts to extract a version string from a file or folder name.
-
-    .OUTPUTS
-        String or $null.
     #>
     [CmdletBinding()]
     param(
@@ -373,9 +366,6 @@ function _Match-KnownRepo {
     <#
     .SYNOPSIS
         Tries to match a tool name against the known DFIR repos lookup table.
-
-    .OUTPUTS
-        PSCustomObject with MatchedKey and GitHubRepo, or $null.
     #>
     [CmdletBinding()]
     param(
@@ -491,20 +481,6 @@ function Get-ScanManifest {
     <#
     .SYNOPSIS
         Loads the scan manifest from disk, or returns a new empty manifest.
-
-    .DESCRIPTION
-        The scan manifest records the last scan timestamp, all known paths
-        (both from config and previously scanned), and paths that have been
-        explicitly marked as ignored.
-
-    .PARAMETER Path
-        Path to the manifest file. Defaults to D:\DFIR-Updater\scan-manifest.json.
-
-    .OUTPUTS
-        PSCustomObject with properties: last_scan, known_paths, ignored_paths.
-
-    .EXAMPLE
-        $manifest = Get-ScanManifest
     #>
     [CmdletBinding()]
     param(
@@ -555,15 +531,6 @@ function Save-ScanManifest {
     <#
     .SYNOPSIS
         Saves the scan manifest to disk.
-
-    .PARAMETER Manifest
-        The manifest object to save.
-
-    .PARAMETER Path
-        Destination file path. Defaults to D:\DFIR-Updater\scan-manifest.json.
-
-    .EXAMPLE
-        Save-ScanManifest -Manifest $manifest
     #>
     [CmdletBinding()]
     param(
@@ -599,34 +566,6 @@ function Find-NewTools {
     <#
     .SYNOPSIS
         Scans the DFIR drive and returns items not tracked in tools-config.json.
-
-    .DESCRIPTION
-        Recursively scans the organized folders on the DFIR drive (up to 2 levels
-        deep) looking for executables, tool directories, and documents. Compares
-        findings against the existing tools-config.json paths and the scan manifest.
-        Returns pre-filled config entry objects for each newly discovered item.
-
-    .PARAMETER ConfigPath
-        Path to tools-config.json. Defaults to D:\DFIR-Updater\tools-config.json.
-
-    .PARAMETER DriveRoot
-        Root path of the DFIR drive. Defaults to D:\.
-
-    .PARAMETER IncludeIgnored
-        If set, also returns items previously marked as ignored in the manifest.
-
-    .PARAMETER UpdateManifest
-        If set, automatically updates the manifest with newly discovered paths.
-        Defaults to $true.
-
-    .OUTPUTS
-        PSCustomObject[] — Array of discovered tool entry objects matching the
-        tools-config.json schema, with an additional "discovery_status" property.
-
-    .EXAMPLE
-        Find-NewTools -Verbose
-    .EXAMPLE
-        Find-NewTools -IncludeIgnored | Format-Table name, path, source_type
     #>
     [CmdletBinding()]
     param(
@@ -663,9 +602,9 @@ function Find-NewTools {
     }
 
     # Normalize config paths for comparison (lowercase, forward slashes)
-    $normalizedConfigPaths = $configPaths | ForEach-Object {
+    $normalizedConfigPaths = @($configPaths | ForEach-Object {
         $_.ToLower().Replace('\', '/')
-    }
+    })
 
     # --- Load manifest ---
     $manifest = Get-ScanManifest
@@ -727,6 +666,7 @@ function Find-NewTools {
             $isIgnored = $normalizedIgnored -contains $normalizedRelative
             if ($isIgnored -and -not $IncludeIgnored) {
                 Write-Verbose "  [IGNORED] $relativePath"
+                $normalizedConfigPaths += $normalizedRelative # Prevent Level 2 scan
                 continue
             }
 
@@ -794,6 +734,7 @@ function Find-NewTools {
 
                 $discovered.Add($entry)
                 Write-Verbose "  [NEW] $relativePath -> $cleanName"
+                $normalizedConfigPaths += $normalizedRelative # Prevent Level 2 double-dipping
             }
             else {
                 # It is a file
@@ -1000,33 +941,6 @@ function Add-ToolToConfig {
     <#
     .SYNOPSIS
         Adds a new tool entry to tools-config.json.
-
-    .DESCRIPTION
-        Appends a tool object to the "tools" array in tools-config.json.
-        The entry can be a PSCustomObject matching the config schema (the
-        extra discovery_status and category properties are stripped before saving).
-        If a tool with the same path already exists, the operation is skipped
-        unless -Force is specified.
-
-    .PARAMETER ToolEntry
-        A PSCustomObject with tool configuration properties.
-        Accepts output from Find-NewTools directly.
-
-    .PARAMETER ConfigPath
-        Path to tools-config.json. Defaults to D:\DFIR-Updater\tools-config.json.
-
-    .PARAMETER Force
-        Overwrite an existing entry with the same path.
-
-    .OUTPUTS
-        System.Boolean — $true if the entry was added, $false otherwise.
-
-    .EXAMPLE
-        $newTools = Find-NewTools
-        $newTools[0] | Add-ToolToConfig
-
-    .EXAMPLE
-        Add-ToolToConfig -ToolEntry $entry -Force
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([bool])]
@@ -1129,6 +1043,70 @@ function Add-ToolToConfig {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. Add-ToolsToConfig
+# ---------------------------------------------------------------------------
+function Add-ToolsToConfig {
+    <#
+    .SYNOPSIS
+        Appends an array of newly discovered tools to tools-config.json.
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [array]$Tools,
+
+        [Parameter(Mandatory=$true)]
+        [string]$ConfigPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        throw "Configuration file not found at $ConfigPath"
+    }
+
+    # Read and parse existing config
+    $rawJson = Get-Content -LiteralPath $ConfigPath -Raw
+    $config = $rawJson | ConvertFrom-Json
+
+    # Ensure tools array exists
+    if ($null -eq $config.tools) {
+        $config | Add-Member -MemberType NoteProperty -Name 'tools' -Value @()
+    }
+
+    $addedCount = 0
+    $toolsList = [System.Collections.ArrayList]@($config.tools)
+
+    foreach ($tool in $Tools) {
+        # Prevent exact duplicates based on path
+        $exists = $toolsList | Where-Object { $_.path -eq $tool.path }
+        
+        if (-not $exists) {
+            # Clean entry
+            $cleanEntry = [PSCustomObject]@{
+                name                 = $tool.name
+                path                 = $tool.path
+                source_type          = $tool.source_type
+                github_repo          = $tool.github_repo
+                github_asset_pattern = $tool.github_asset_pattern
+                download_url         = $tool.download_url
+                current_version      = $tool.current_version
+                version_pattern      = $tool.version_pattern
+                install_type         = $tool.install_type
+                notes                = $tool.notes
+            }
+            [void]$toolsList.Add($cleanEntry)
+            $addedCount++
+        }
+    }
+
+    # Save changes if new tools were appended
+    if ($addedCount -gt 0) {
+        $config.tools = $toolsList.ToArray()
+        $config.last_updated = (Get-Date -Format 'yyyy-MM-dd')
+        $jsonOutput = $config | ConvertTo-Json -Depth 10
+        Set-Content -LiteralPath $ConfigPath -Value $jsonOutput -Encoding UTF8
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 5. Remove-IgnoredItem (Add to ignore list)
 # ---------------------------------------------------------------------------
 function Remove-IgnoredItem {
@@ -1136,33 +1114,6 @@ function Remove-IgnoredItem {
     .SYNOPSIS
         Marks an item as "ignored" in the scan manifest so it will not be
         flagged as new in future scans.
-
-    .DESCRIPTION
-        Adds the specified path to the ignored_paths list in scan-manifest.json.
-        The item will no longer appear in Find-NewTools output unless the
-        -IncludeIgnored switch is used.
-
-        Despite the name (which follows PowerShell Remove-* convention for
-        removing items from the "new" results), this function adds to the
-        ignore list. To un-ignore a path, use the -Undo switch.
-
-    .PARAMETER Path
-        Relative path of the item to ignore (as it appears in discovery results).
-
-    .PARAMETER Undo
-        If specified, removes the path from the ignored list (un-ignores it).
-
-    .PARAMETER ManifestPath
-        Path to the scan manifest. Defaults to D:\DFIR-Updater\scan-manifest.json.
-
-    .OUTPUTS
-        System.Boolean — $true if the operation succeeded.
-
-    .EXAMPLE
-        Remove-IgnoredItem -Path '02_Analysis/SomeTool'
-
-    .EXAMPLE
-        Remove-IgnoredItem -Path '02_Analysis/SomeTool' -Undo
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -1250,6 +1201,7 @@ Auto-Discovery module loaded. Available functions:
   Get-ScanManifest      - Load the scan manifest
   Save-ScanManifest     - Save the scan manifest
   Add-ToolToConfig      - Add a discovered tool to tools-config.json
+  Add-ToolsToConfig     - Add an array of discovered tools to tools-config.json
   Remove-IgnoredItem    - Mark/unmark items as ignored in the manifest
   Get-KnownDFIRRepos    - Return the DFIR GitHub repos lookup table
 "@
